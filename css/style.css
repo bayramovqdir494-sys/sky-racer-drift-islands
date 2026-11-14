@@ -165,3 +165,23 @@ html,body{margin:0;height:100%;overflow:hidden;background:#07111c;color:var(--tx
 .tile-acts .btn.champ{background:linear-gradient(180deg,#ffb347,#ff7a18);color:#1a1008;border:none;font-weight:800}
 .world-head{grid-column:1/-1;margin:10px 2px 0;font:800 13px/1 Trebuchet MS,sans-serif;letter-spacing:1.4px;
   text-transform:uppercase;color:#dce7ff;opacity:.85}
+
+/* Portrait rotate gate — phones only, shown from JS */
+#rotateOverlay{position:fixed;inset:0;z-index:120;display:none;flex-direction:column;align-items:center;justify-content:center;
+  gap:22px;background:rgba(7,16,28,0.96);color:#fff;pointer-events:auto;text-align:center;padding:28px 20px;
+  -webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px)}
+#rotateOverlay.on{display:flex}
+.rotate-phone{width:72px;height:124px;border:5px solid #ffc526;border-radius:16px;position:relative;
+  background:linear-gradient(180deg,#1a2a40,#0a121c);box-shadow:0 0 28px #ffc52666,0 8px 20px #0008;
+  animation:phone-turn 1.7s ease-in-out infinite}
+.rotate-phone:before{content:"";position:absolute;top:10px;left:50%;transform:translateX(-50%);width:24px;height:5px;border-radius:3px;background:#ffc526}
+.rotate-phone:after{content:"";position:absolute;bottom:8px;left:50%;transform:translateX(-50%);width:11px;height:11px;border-radius:50%;border:2px solid #ffc526}
+@keyframes phone-turn{
+  0%,22%{transform:rotate(0deg)}
+  48%,78%{transform:rotate(90deg)}
+  100%{transform:rotate(0deg)}
+}
+.rotate-title{font-size:clamp(22px,7vw,38px);font-weight:800;letter-spacing:.06em;color:#ffc526;
+  text-shadow:0 3px 0 #4a2a00,0 0 18px #ffb00055;text-transform:none}
+.rotate-sub{font-size:clamp(14px,3.6vw,18px);color:#c9d6e8;letter-spacing:.04em}
+

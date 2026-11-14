@@ -57,6 +57,11 @@ export function createRacer(spec) {
     wrot: 0,
     lastQuery: null,
     hints: { gas: false, drift: false, jump: false },
+    crashCool: 0,
+    crashSlip: 0,
+    joltPitch: 0,
+    joltRoll: 0,
+    stuckT: 0,
     // mission counters local
     driftAcc: 0,
     nitroUses: 0,
@@ -326,8 +331,30 @@ function applyInput(racer, inp, track, dt, fx, wind) {
   const q = track.query(racer.pos.x, racer.pos.y, racer.pos.z);
   racer.lastQuery = q;
 
+  // If a crash left someone wedged in the weeds, nudge back toward the road.
+  if (!racer.air && q && q.valid && q.onIsland && q.absLat > (q.roadHalf || 5) + 0.6 && racer.speed < 5.5) {
+    racer.stuckT = (racer.stuckT || 0) + dt;
+    if (racer.stuckT > 1.15 && q.right && q.tan) {
+      const side = Math.sign(q.lateral || 1) || 1;
+      racer.pos.x -= q.right.x * side * Math.min(2.4, q.absLat - q.roadHalf * 0.35);
+      racer.pos.z -= q.right.z * side * Math.min(2.4, q.absLat - q.roadHalf * 0.35);
+      racer.pos.y = (q.height != null ? q.height : racer.pos.y) + 0.04;
+      racer.yaw = yawOf(q.tan);
+      racer.speed = Math.max(12, racer.stats.top * 0.45);
+      racer.vel.set(Math.sin(racer.yaw) * racer.speed, 0, Math.cos(racer.yaw) * racer.speed);
+      racer.stuckT = 0;
+      racer.crashSlip = 0;
+    }
+  } else {
+    racer.stuckT = 0;
+  }
+
   // progress + anti-cheat + wrong-way
-  const ev = { respawned: false, land: false, bigJump: false, cut: false };
+  const ev = { respawned: false, land: false, bigJump: false, cut: false, crash: null };
+  racer.crashCool = Math.max(0, (racer.crashCool || 0) - dt);
+  if (racer.crashSlip > 0) racer.crashSlip = Math.max(0, racer.crashSlip - dt);
+  racer.joltPitch = lerp(racer.joltPitch || 0, 0, 1 - Math.pow(0.0004, dt));
+  racer.joltRoll = lerp(racer.joltRoll || 0, 0, 1 - Math.pow(0.0004, dt));
   const qOnRibbon = q.valid && (q.onRoad || q.onIsland) && !q.inGap;
   if (qOnRibbon) racer._lastH = q.height;
   if (qOnRibbon) {
@@ -472,7 +499,10 @@ function applyInput(racer, inp, track, dt, fx, wind) {
     }
 
     // velocity vs heading (slip) — a committed drift gets looser; over-rotating costs speed
-    const align = racer.drifting ? (1.28 + grip * 1.15 - racer.drift * 0.4) : (6 + grip * 7);
+    // After a prop hit, keep the bounce for a beat instead of snapping back to heading.
+    const align = racer.crashSlip > 0
+      ? 0.85
+      : (racer.drifting ? (1.28 + grip * 1.15 - racer.drift * 0.4) : (6 + grip * 7));
     const want = heading.multiplyScalar(racer.speed);
     racer.vel.x = lerp(racer.vel.x, want.x, 1 - Math.pow(Math.exp(-align), dt));
     racer.vel.z = lerp(racer.vel.z, want.z, 1 - Math.pow(Math.exp(-align), dt));
@@ -653,8 +683,8 @@ function syncMesh(racer, q) {
   const e = m.rotation;
   e.order = 'YXZ';
   m.rotation.y = racer.yaw;
-  m.rotation.x = racer.pitch;
-  m.rotation.z = racer.roll;
+  m.rotation.x = racer.pitch + (racer.joltPitch || 0);
+  m.rotation.z = racer.roll + (racer.joltRoll || 0);
 }
 
 export function pushApart(racers, dt, fx) {
@@ -690,6 +720,93 @@ export function pushApart(racers, dt, fx) {
           }
           hits.push({ a, b, imp });
         }
+      }
+    }
+  }
+  return hits;
+}
+
+const SOLID_PROP = {
+  rock:    { tight: 0.70, minR: 0.85 },
+  pine:    { tight: 0.30, minR: 0.48 },
+  oak:     { tight: 0.34, minR: 0.55 },
+  cactus:  { tight: 0.58, minR: 0.45 },
+  crystal: { tight: 0.52, minR: 0.65 }
+};
+const CAR_R = 1.15;
+
+function hash02(a, b) {
+  return Math.abs(Math.sin(a * 127.1 + b * 311.7) * 43758.5453) % 1;
+}
+
+function colliderFrom(kind, p, mesh) {
+  const spec = SOLID_PROP[kind];
+  if (!spec) return null;
+  const geo = mesh.geometry;
+  if (geo && !geo.boundingBox) geo.computeBoundingBox();
+  const bb = geo && geo.boundingBox;
+  const sx = bb ? (bb.max.x - bb.min.x) : 1;
+  const sy = bb ? (bb.max.y - bb.min.y) : 1;
+  const sz = bb ? (bb.max.z - bb.min.z) : 1;
+  const r = Math.max(spec.minR, 0.5 * Math.max(sx, sz) * p.scale * spec.tight);
+  const h = Math.max(1.15, sy * p.scale);
+  return { x: p.pos.x, y: p.islandY, z: p.pos.z, r, h, kind };
+}
+
+export function collideProps(racers, track, dt, fx) {
+  const cols = track && track.colliders;
+  if (!cols || !cols.length) return [];
+  const hits = [];
+  for (const r of racers) {
+    if ((r.invuln || 0) > 0.45) continue;
+    for (let i = 0; i < cols.length; i++) {
+      const c = cols[i];
+      const dy = r.pos.y - c.y;
+      if (dy > c.h + 0.5 || dy < -1.15) continue;
+      const dx = r.pos.x - c.x, dz = r.pos.z - c.z;
+      const min = CAR_R + c.r + 0.04;
+      const d2 = dx * dx + dz * dz;
+      if (d2 >= min * min) continue;
+      const d = Math.sqrt(Math.max(1e-6, d2));
+      const nx = dx / d, nz = dz / d;
+      const overlap = min - d;
+      r.pos.x += nx * (overlap + 0.02);
+      r.pos.z += nz * (overlap + 0.02);
+      const vOut = r.vel.x * nx + r.vel.z * nz;
+      const impact = vOut < 0 ? -vOut : 0;
+      if (vOut < 0) {
+        r.vel.x += nx * (1 + 0.32) * impact;
+        r.vel.z += nz * (1 + 0.32) * impact;
+      }
+      // Always cancel leftover inward velocity so the car slides, not sinks in
+      const vOut2 = r.vel.x * nx + r.vel.z * nz;
+      if (vOut2 < 0) {
+        r.vel.x -= nx * vOut2;
+        r.vel.z -= nz * vOut2;
+      }
+      if (impact > 2.2) {
+        const lose = clamp(0.14 + impact * 0.02, 0.14, 0.40);
+        r.speed *= (1 - lose);
+        r.speed = Math.max(5, r.speed);
+        const hs2 = Math.hypot(r.vel.x, r.vel.z) || 1;
+        r.vel.x = r.vel.x / hs2 * r.speed;
+        r.vel.z = r.vel.z / hs2 * r.speed;
+        const hx = Math.sin(r.yaw), hz = Math.cos(r.yaw);
+        const side = hx * nz - hz * nx;
+        r.yaw += clamp(side * 0.10, -0.14, 0.14);
+        r.joltPitch = clamp(-0.14 - impact * 0.012, -0.38, 0.08);
+        r.joltRoll = clamp(-side * (0.22 + impact * 0.02), -0.42, 0.42);
+        r.crashSlip = Math.max(r.crashSlip || 0, 0.2);
+        r.drifting = false;
+        const hard = impact > 14 || r.speed > 22;
+        if ((r.crashCool || 0) <= 0) {
+          r.crashCool = 0.32;
+          const pos = new THREE.Vector3(c.x + nx * c.r, r.pos.y + 0.45, c.z + nz * c.r);
+          if (fx && fx.crash) fx.crash(pos, new THREE.Vector3(nx, 0.4, nz), hard ? 1 : 0.7);
+          hits.push({ racer: r, pos, nx, nz, impact, hard, kind: c.kind, player: !!r.isPlayer });
+        }
+      } else {
+        r.speed = Math.hypot(r.vel.x, r.vel.z);
       }
     }
   }
@@ -749,6 +866,10 @@ export function stepRace(state, inputs, dt) {
       }
     }
     pushApart(state.racers, STEP, state.fx);
+    const propHits = collideProps(state.racers, state.track, STEP, state.fx);
+    for (const h of propHits) {
+      events.push({ type: 'crash', player: h.player, hard: h.hard, impact: h.impact, kind: h.kind, pos: h.pos });
+    }
     updatePlaces(state.racers);
   }
   return events;
@@ -760,9 +881,10 @@ export function decorateTrack(track, quality) {
   const cap = quality === 'low' ? 0.4 : quality === 'med' ? 0.7 : 0.9;
   const byKind = {};
   for (const p of list) {
-    if (Math.random() > cap) continue;
+    if (hash02(p.pos.x, p.pos.z) > cap) continue;
     (byKind[p.kind] || (byKind[p.kind] = [])).push(p);
   }
+  const colliders = [];
   const dummy = new THREE.Object3D();
   for (const kind of Object.keys(byKind)) {
     const arr = byKind[kind];
@@ -774,6 +896,12 @@ export function decorateTrack(track, quality) {
         const m = makeProp(kind, p.scale);
         m.position.copy(p.pos); m.position.y = p.islandY; m.rotation.y = p.yaw;
         group.add(m);
+        let mesh = null;
+        m.traverse(o => { if (o.isMesh && !mesh) mesh = o; });
+        if (mesh) {
+          const col = colliderFrom(kind, p, mesh);
+          if (col) colliders.push(col);
+        }
       }
       continue;
     }
@@ -795,10 +923,25 @@ export function decorateTrack(track, quality) {
       dummy.scale.setScalar(p.scale);
       dummy.updateMatrix();
       inst.setMatrixAt(i, dummy.matrix);
+      const col = colliderFrom(kind, p, srcMesh);
+      if (col) colliders.push(col);
     });
     inst.instanceMatrix.needsUpdate = true;
     group.add(inst);
   }
+  // Keep the contact plane just outside the asphalt so a fair racing
+  // line never clips a rock, but running off the road still hits it.
+  for (const c of colliders) {
+    const q = track.query(c.x, c.y + 0.4, c.z);
+    if (!q || !q.valid || q.roadHalf == null) continue;
+    const lat = (typeof q.absLat === 'number') ? q.absLat : Math.abs(q.lateral || 0);
+    // Contact starts ~0.9m off the asphalt so a fair (even slightly wide) line is clear.
+    const margin = (c.kind === 'pine' || c.kind === 'oak') ? 1.15 : 0.9;
+    const maxR = lat - q.roadHalf - CAR_R - margin;
+    if (maxR < 0.32) c.r = -1;
+    else if (maxR < c.r) c.r = maxR;
+  }
+  track.colliders = colliders.filter(c => c.r >= 0.32);
   return group;
 }
 

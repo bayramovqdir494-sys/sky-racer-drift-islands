@@ -10,13 +10,13 @@ import * as UI from './ui.js';
 
 const canvas = document.getElementById('c');
 const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
-renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
+renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
 renderer.setSize(innerWidth, innerHeight, false);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.14;
+renderer.toneMappingExposure = 1.24;
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.15, 600);
@@ -29,7 +29,7 @@ let quality = 'high';
 let trackBuilt = null, sky = null, lights = null, props = null, fx = null;
 let field = null, raceState = null;
 let ghostMesh = null, ghostSamples = null, recordBuf = null;
-let camShake = 0, slowMo = 0;
+let camShake = 0, slowMo = 0, lastCrash = null;
 let mode = 'boot'; // boot, menu, countdown, race, pause, result
 let selectedTrack = 'green';
 let camPos = new THREE.Vector3(0, 16, 24);
@@ -57,22 +57,50 @@ function resize() {
 }
 window.addEventListener('resize', resize);
 
+function applyAnisotropy(root, value) {
+  if (!root) return;
+  root.traverse(o => {
+    if (!o.isMesh && !o.isInstancedMesh) return;
+    const mats = o.material ? (Array.isArray(o.material) ? o.material : [o.material]) : [];
+    for (const m of mats) {
+      if (!m) continue;
+      for (const key of ['map', 'normalMap', 'roughnessMap', 'metalnessMap', 'aoMap', 'emissiveMap']) {
+        const tex = m[key];
+        if (tex && tex.anisotropy !== undefined) {
+          tex.anisotropy = value;
+          tex.minFilter = THREE.LinearMipmapLinearFilter;
+          tex.magFilter = THREE.LinearFilter;
+          tex.needsUpdate = true;
+        }
+      }
+    }
+  });
+}
+
 function applyQuality() {
   const low = quality === 'low', med = quality === 'med';
-  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, low ? 0.75 : med ? 1.0 : 1.5));
+  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, low ? 0.85 : med ? 1.25 : 2));
+  renderer.toneMappingExposure = low ? 1.12 : med ? 1.2 : 1.26;
   renderer.shadowMap.enabled = !low;
-  if (lights && lights.sun) lights.sun.castShadow = !low;
-  if (fx && fx.setQuality) fx.setQuality(quality);
-  if (props) {
-    const cap = low ? 0.4 : med ? 0.7 : 1;
-    let n = 0;
-    props.traverse(o => {
-      if (o.isInstancedMesh) {
-        n++;
-        o.visible = cap >= 0.99 || ((n % 5) < Math.round(5 * cap));
+  if (lights && lights.sun) {
+    lights.sun.castShadow = !low;
+    const size = low ? 512 : med ? 1024 : 2048;
+    if (lights.sun.shadow.mapSize.x !== size) {
+      lights.sun.shadow.mapSize.set(size, size);
+      if (lights.sun.shadow.map) {
+        lights.sun.shadow.map.dispose();
+        lights.sun.shadow.map = null;
       }
-    });
+    }
+    lights.sun.shadow.bias = -0.0006;
+    lights.sun.shadow.normalBias = 0.04;
+    lights.sun.shadow.radius = low ? 1 : med ? 2 : 3;
   }
+  if (fx && fx.setQuality) fx.setQuality(quality);
+  const maxAni = (renderer.capabilities && renderer.capabilities.getMaxAnisotropy) ? renderer.capabilities.getMaxAnisotropy() : 8;
+  const ani = Math.min(maxAni, low ? 2 : med ? 8 : 16);
+  applyAnisotropy(world, ani);
+  applyAnisotropy(scene, ani);
 }
 
 async function boot() {
@@ -201,7 +229,7 @@ function startRace(trackId, opts = {}) {
   mutate(s => s.lastTrack = selectedTrack);
   const track = buildWorld(selectedTrack, opts);
   const rec = track.rec;
-  camShake = 0; slowMo = 0;
+  camShake = 0; slowMo = 0; lastCrash = null;
   ghostSamples = null; recordBuf = [];
   if (opts.mode === 'trial') {
     const g = (getSave().ghosts || {})[selectedTrack];
@@ -252,6 +280,7 @@ function beginRacing() {
   mode = 'race';
   raceState.phase = 'race';
   sdk.setPlaying(true);
+  if (field && field.player) snapChase(field.player);
 }
 
 function pauseRace() {
@@ -417,6 +446,12 @@ function sfxNitro() {
   sfxBurst(0.14, 0.05, 900);
 }
 
+function sfxCrash(hard) {
+  beep(hard ? 72 : 108, hard ? 0.16 : 0.11, hard ? 0.11 : 0.07, 'sine');
+  beep(hard ? 165 : 210, 0.08, 0.04, 'square');
+  sfxBurst(hard ? 0.22 : 0.14, hard ? 0.12 : 0.07, hard ? 150 : 230);
+}
+
 function setDriftScreech(on, intensity) {
   if (!getSave().settings.audio) {
     if (setDriftScreech.g) setDriftScreech.g.gain.value = 0;
@@ -467,17 +502,33 @@ function engineAudio(speed, nit, drift) {
   } catch (e) {}
 }
 
-function chaseCam(p, dt) {
-  const back = 9.2 + Math.min(3.2, p.speed * 0.09);
-  const height = 3.7;
-  const ahead = 10 + p.speed * 0.12;
+function chaseOffset(p) {
+  // A little closer and lower than the original 9.2 / 3.7, but far enough
+  // to clear the grid car behind the player and keep the road readable.
+  const back = 8.25 + Math.min(2.8, (p.speed || 0) * 0.08);
+  const height = 3.35 + (p.air ? 1.05 : 0);
+  const ahead = 9.2 + (p.speed || 0) * 0.11;
   const dir = new THREE.Vector3(Math.sin(p.yaw), 0, Math.cos(p.yaw));
-  const want = p.pos.clone().addScaledVector(dir, -back);
-  want.y += height + (p.air ? 1.2 : 0);
-  camPos.lerp(want, 1 - Math.pow(0.0008, dt));
+  const pos = p.pos.clone().addScaledVector(dir, -back);
+  pos.y += height;
   const look = p.pos.clone().addScaledVector(dir, ahead);
-  look.y += 0.8;
-  camLook.lerp(look, 1 - Math.pow(0.0004, dt));
+  look.y += 0.65;
+  return { pos, look, back, height, ahead };
+}
+
+function snapChase(p) {
+  if (!p) return;
+  const o = chaseOffset(p);
+  camPos.copy(o.pos);
+  camLook.copy(o.look);
+  camera.position.copy(camPos);
+  camera.lookAt(camLook);
+}
+
+function chaseCam(p, dt) {
+  const o = chaseOffset(p);
+  camPos.lerp(o.pos, 1 - Math.pow(0.0005, dt));
+  camLook.lerp(o.look, 1 - Math.pow(0.00035, dt));
   camera.position.copy(camPos);
   if (camShake > 0) {
     camera.position.x += (Math.random() - 0.5) * camShake;
@@ -486,7 +537,7 @@ function chaseCam(p, dt) {
     camShake = Math.max(0, camShake - dt * 7.5);
   }
   camera.lookAt(camLook);
-  camera.fov = lerp(camera.fov, p.nitOn ? 68 : 58 + p.speed * 0.12, 1 - Math.pow(0.05, dt));
+  camera.fov = lerp(camera.fov, p.nitOn ? 66 : 56 + p.speed * 0.10, 1 - Math.pow(0.05, dt));
   camera.updateProjectionMatrix();
 }
 
@@ -554,6 +605,14 @@ function loop(now) {
         if (qaScale <= 1) sfxLand(!!e.hard);
       }
       if (e.type === 'bigJump') slowMo = Math.max(slowMo, 0.62);
+      if (e.type === 'crash') {
+        lastCrash = { t: raceClock, hard: !!e.hard, impact: e.impact, kind: e.kind, player: !!e.player };
+        if (e.player) {
+          camShake = Math.min(1.05, 0.32 + (e.hard ? 0.42 : 0.18) + Math.min(0.25, (e.impact || 0) * 0.02));
+          if (qaScale <= 1) sfxCrash(!!e.hard);
+          try { if (navigator.vibrate) navigator.vibrate(e.hard ? [16, 24, 22] : 18); } catch (err) {}
+        }
+      }
     }
     if (p.nitOn && !engineAudio._wasNit && qaScale <= 1) sfxNitro();
     engineAudio._wasNit = !!p.nitOn;
@@ -692,13 +751,85 @@ function installQA() {
     lockQuality: false,
     get quality() { return quality; },
     setQuality(q) { quality = q; applyQuality(); return quality; },
+    renderInfo() {
+      return {
+        quality, fps: fpsAvg,
+        pixelRatio: renderer.getPixelRatio(),
+        exposure: renderer.toneMappingExposure,
+        shadows: renderer.shadowMap.enabled,
+        shadowSize: lights && lights.sun ? lights.sun.shadow.mapSize.x : 0,
+        calls: renderer.info.render.calls,
+        triangles: renderer.info.render.triangles,
+        camBack: field && field.player ? +chaseOffset(field.player).back.toFixed(2) : null,
+        colliders: trackBuilt && trackBuilt.colliders ? trackBuilt.colliders.length : 0
+      };
+    },
+    nearestCollider(kind) {
+      if (!trackBuilt || !trackBuilt.colliders || !field) return null;
+      const p = field.player;
+      let best = null, bd = 1e9;
+      for (const c of trackBuilt.colliders) {
+        if (kind && c.kind !== kind) continue;
+        const d = Math.hypot(c.x - p.pos.x, c.z - p.pos.z);
+        if (d < bd) { bd = d; best = c; }
+      }
+      return best && { x: best.x, y: best.y, z: best.z, r: best.r, h: best.h, kind: best.kind, dist: bd };
+    },
+    lastCrash() { return lastCrash; },
+    snapChase() { if (field) snapChase(field.player); },
+    ramProp(kind) {
+      if (!trackBuilt || !trackBuilt.colliders || !field) return null;
+      const p = field.player;
+      let best = null, bestScore = 1e9;
+      for (const col of trackBuilt.colliders) {
+        if (kind && col.kind !== kind) continue;
+        const q = trackBuilt.query(col.x, col.y + 0.5, col.z);
+        if (!q || !q.valid || !q.onIsland || q.inGap) continue;
+        if (q.t < 0.08 || q.t > 0.92) continue;
+        const score = Math.abs(q.t - 0.25);
+        if (score < bestScore) { bestScore = score; best = { col, q }; }
+      }
+      if (!best) {
+        const c = this.nearestCollider(kind);
+        if (!c) return null;
+        best = { col: c, q: trackBuilt.query(c.x, c.y + 0.5, c.z) };
+      }
+      const c = best.col, q = best.q;
+      const s = (q && q.t != null) ? trackBuilt.atT(q.t) : null;
+      let nx, nz, px, pz, py;
+      if (s && s.right) {
+        const side = Math.sign((q && q.lateral) || 1) || 1;
+        const approachLat = side * Math.min(s.islandHalf - 0.8, Math.max(s.roadHalf + 0.7, Math.abs((q && q.absLat) || (s.roadHalf + 2)) - c.r - 1.6));
+        px = s.pos.x + s.right.x * approachLat;
+        pz = s.pos.z + s.right.z * approachLat;
+        py = s.pos.y + 0.3;
+        nx = c.x - px; nz = c.z - pz;
+        const d = Math.hypot(nx, nz) || 1; nx /= d; nz /= d;
+      } else {
+        nx = 1; nz = 0; px = c.x - (c.r + 2); pz = c.z; py = c.y + 0.35;
+      }
+      p.pos.set(px, py, pz);
+      p.yaw = Math.atan2(nx, nz);
+      p.t = (q && q.t) || p.t;
+      p.speed = 24;
+      p.vel.set(Math.sin(p.yaw) * 24, 0, Math.cos(p.yaw) * 24);
+      p.air = false; p.crashCool = 0; p.crashSlip = 0; p.invuln = 0;
+      lastCrash = null;
+      snapChase(p);
+      return { x: c.x, y: c.y, z: c.z, r: c.r, h: c.h, kind: c.kind, t: q && q.t };
+    },
     advance(sec) {
       if (!raceState || !field) return null;
       let left = Math.max(0, +sec || 0);
-      while (left > 0 && mode === 'race' && !field.player.finished) {
+      while (left > 0 && (mode === 'race' || mode === 'finish') && !field.racers.every(r => r.finished)) {
         const chunk = Math.min(0.4, left);
-        stepRace(raceState, input.read(), chunk);
+        const evs = stepRace(raceState, input.read(), chunk);
         raceClock += chunk;
+        if (evs) {
+          for (const e of evs) {
+            if (e.type === 'crash') lastCrash = { t: raceClock, hard: !!e.hard, impact: e.impact, kind: e.kind, player: !!e.player };
+          }
+        }
         left -= chunk;
       }
       const p = field.player;
@@ -721,6 +852,7 @@ function installQA() {
   // autopilot: reuse AI on player
   const origRead = input.read;
   input.read = () => {
+    if (window.__qa && window.__qa.forceInput) return window.__qa.forceInput;
     if (window.__qa && window.__qa.auto && field && trackBuilt && mode === 'race' && !field.player.finished) {
       // Center-line look-ahead + early nitro: stable on jumps. In-game AI still uses aiInput.
       const look = 16 / trackBuilt.length;

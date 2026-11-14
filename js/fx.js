@@ -20,8 +20,8 @@ export function createFX(scene) {
   const dustMat = makeSpriteMat('rgba(220,200,160,0.5)');
   dustMat.blending = THREE.NormalBlending;
 
-  const N = 28, SN = 16;
-  const smokes = [], sparks = [];
+  const N = 28, SN = 28;
+  const smokes = [], sparks = [], debris = [];
   for (let i = 0; i < N; i++) {
     const s = new THREE.Sprite(smokeMat.clone());
     s.visible = false; s.userData.life = 0;
@@ -31,6 +31,15 @@ export function createFX(scene) {
     const s = new THREE.Sprite(sparkMat.clone());
     s.visible = false; s.userData.life = 0;
     scene.add(s); sparks.push(s);
+  }
+  const debrisGeo = new THREE.BoxGeometry(0.16, 0.12, 0.2);
+  const debrisMat = new THREE.MeshStandardMaterial({ color: 0x8a7460, roughness: 0.92, metalness: 0.08 });
+  let di = 0;
+  for (let i = 0; i < 16; i++) {
+    const m = new THREE.Mesh(debrisGeo, debrisMat);
+    m.visible = false; m.castShadow = false; m.receiveShadow = false;
+    m.userData.life = 0;
+    scene.add(m); debris.push(m);
   }
 
   let si = 0, ki = 0;
@@ -89,6 +98,45 @@ export function createFX(scene) {
     dust(pos, vel) {
       spawn(smokes, sri, pos, vel, 0.4, 0.9, 0xdcc8a0);
     },
+    crash(pos, normal, strength = 1) {
+      const nrm = normal || new THREE.Vector3(0, 1, 0);
+      const nSpark = this._low ? 4 : Math.round(7 * strength + 1);
+      const nDust = this._low ? 2 : 4;
+      for (let i = 0; i < nSpark; i++) {
+        const v = new THREE.Vector3(
+          nrm.x * (4 + Math.random() * 7) + (Math.random() - 0.5) * 7,
+          4 + Math.random() * 9,
+          nrm.z * (4 + Math.random() * 7) + (Math.random() - 0.5) * 7
+        );
+        const p = pos.clone();
+        p.x += (Math.random() - 0.5) * 0.45;
+        p.y += 0.2 + Math.random() * 0.5;
+        p.z += (Math.random() - 0.5) * 0.45;
+        spawn(sparks, ski, p, v, 0.28 + Math.random() * 0.22, 0.2 + Math.random() * 0.16);
+      }
+      for (let i = 0; i < nDust; i++) {
+        spawn(smokes, sri, pos.clone().setY(pos.y + 0.12), new THREE.Vector3((Math.random() - 0.5) * 2.4, 1.4, (Math.random() - 0.5) * 2.4), 0.45, 0.85);
+      }
+      const nDeb = this._low ? 3 : 7;
+      for (let i = 0; i < nDeb; i++) {
+        const m = debris[di % debris.length];
+        di++;
+        m.position.copy(pos);
+        m.position.y += 0.2;
+        m.userData.vel = new THREE.Vector3(
+          nrm.x * (2 + Math.random() * 5) + (Math.random() - 0.5) * 5,
+          3 + Math.random() * 7,
+          nrm.z * (2 + Math.random() * 5) + (Math.random() - 0.5) * 5
+        );
+        m.userData.spin = new THREE.Vector3((Math.random() - 0.5) * 10, (Math.random() - 0.5) * 10, (Math.random() - 0.5) * 10);
+        m.userData.life = 0.45 + Math.random() * 0.25;
+        m.userData.max = m.userData.life;
+        m.visible = true;
+        m.userData._s = 0.7 + Math.random() * 0.8;
+        m.scale.setScalar(m.userData._s);
+        m.rotation.set(Math.random() * 6, Math.random() * 6, Math.random() * 6);
+      }
+    },
     update(dt, camera, speed01) {
       for (const s of smokes) {
         if (!s.visible) continue;
@@ -110,6 +158,21 @@ export function createFX(scene) {
         const k = s.userData.life / s.userData.max;
         s.material.opacity = k;
         s.scale.setScalar(s.userData.scale * (0.6 + k));
+      }
+      for (const m of debris) {
+        if (!m.visible) continue;
+        m.userData.life -= dt;
+        if (m.userData.life <= 0) { m.visible = false; continue; }
+        m.position.addScaledVector(m.userData.vel, dt);
+        m.userData.vel.y -= 22 * dt;
+        m.userData.vel.multiplyScalar(0.98);
+        if (m.userData.spin) {
+          m.rotation.x += m.userData.spin.x * dt;
+          m.rotation.y += m.userData.spin.y * dt;
+          m.rotation.z += m.userData.spin.z * dt;
+        }
+        const k = m.userData.life / m.userData.max;
+        m.scale.setScalar(Math.max(0.05, (m.userData._s || 1) * k));
       }
       // speed lines in camera space
       const show = speed01 > 0.72 && !this._low;
@@ -142,6 +205,7 @@ export function createFX(scene) {
     reset() {
       for (const s of smokes) s.visible = false;
       for (const s of sparks) s.visible = false;
+      for (const m of debris) m.visible = false;
       for (const l of speedLines) l.visible = false;
       for (let i = 0; i < SK; i++) {
         skidDummy.position.set(0, -50, 0);
@@ -250,20 +314,22 @@ export function makeSky(theme) {
 export function makeLights(theme, scene) {
   scene.background = new THREE.Color(theme.skyMid);
   scene.fog = new THREE.Fog(theme.fog, theme.fogN, theme.fogF);
-  const amb = new THREE.AmbientLight(theme.ambient, 0.55);
-  const hemi = new THREE.HemisphereLight(theme.hemiTop, theme.hemiBot, 0.7);
-  const sun = new THREE.DirectionalLight(theme.sun, theme.sunInt);
+  const amb = new THREE.AmbientLight(theme.ambient, 0.6);
+  const hemi = new THREE.HemisphereLight(theme.hemiTop, theme.hemiBot, 0.8);
+  const sun = new THREE.DirectionalLight(theme.sun, Math.min(1.35, (theme.sunInt || 1) * 1.08));
   sun.position.set(40, 80, 20);
   sun.castShadow = true;
   sun.shadow.mapSize.set(1024, 1024);
-  sun.shadow.camera.near = 10;
+  sun.shadow.camera.near = 8;
   sun.shadow.camera.far = 260;
-  sun.shadow.camera.left = -90;
-  sun.shadow.camera.right = 90;
-  sun.shadow.camera.top = 90;
-  sun.shadow.camera.bottom = -90;
-  sun.shadow.bias = -0.001;
-  const fill = new THREE.DirectionalLight(theme.neon || theme.aurora ? 0xc8a8ff : 0xa8c8ff, theme.neon || theme.aurora ? 0.55 : 0.32);
+  sun.shadow.camera.left = -80;
+  sun.shadow.camera.right = 80;
+  sun.shadow.camera.top = 80;
+  sun.shadow.camera.bottom = -80;
+  sun.shadow.bias = -0.0007;
+  sun.shadow.normalBias = 0.035;
+  sun.shadow.radius = 2.2;
+  const fill = new THREE.DirectionalLight(theme.neon || theme.aurora ? 0xc8a8ff : 0xa8c8ff, theme.neon || theme.aurora ? 0.62 : 0.38);
   fill.position.set(-30, 20, -40);
   scene.add(amb, hemi, sun, fill);
   return { amb, hemi, sun, fill };

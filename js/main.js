@@ -31,6 +31,9 @@ let field = null, raceState = null;
 let ghostMesh = null, ghostSamples = null, recordBuf = null;
 let camShake = 0, slowMo = 0, lastCrash = null;
 let mode = 'boot'; // boot, menu, countdown, race, pause, result
+let orientHold = false;
+let orientPausedFrom = null;
+let countdownTick = null;
 let selectedTrack = 'green';
 let camPos = new THREE.Vector3(0, 16, 24);
 let camLook = new THREE.Vector3();
@@ -49,13 +52,98 @@ function setLoad(p, t) {
   if (t) document.getElementById('loadtxt').textContent = t;
 }
 
+function isPhoneLike() {
+  const ua = navigator.userAgent || '';
+  const uaMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini|Mobile/i.test(ua);
+  const touch = (navigator.maxTouchPoints || 0) > 0 || 'ontouchstart' in window;
+  const coarse = window.matchMedia('(pointer: coarse)').matches || window.matchMedia('(hover: none)').matches;
+  const shortSide = Math.min(innerWidth, innerHeight);
+  // Phones/tablets, or a touch viewport that is phone-sized. Desktop and wide windows stay clear.
+  if (uaMobile) return true;
+  if ((touch || coarse) && shortSide <= 520) return true;
+  return false;
+}
+
+function needsRotateOverlay() {
+  if (!isPhoneLike()) return false;
+  if (innerWidth >= innerHeight) return false; // already landscape / wide window
+  const portraitMQ = window.matchMedia('(orientation: portrait)').matches;
+  return portraitMQ || innerHeight > innerWidth;
+}
+
+function tryLockLandscape() {
+  try {
+    const o = screen.orientation;
+    if (o && typeof o.lock === 'function') {
+      const p = o.lock('landscape');
+      if (p && typeof p.catch === 'function') p.catch(() => {});
+    }
+  } catch (e) {}
+}
+
+function applyOrientation() {
+  const el = document.getElementById('rotateOverlay');
+  const need = needsRotateOverlay();
+  if (el) {
+    el.classList.toggle('on', need);
+    el.setAttribute('aria-hidden', need ? 'false' : 'true');
+  }
+  document.body.classList.toggle('portrait-lock', need);
+  if (need && !orientHold) {
+    orientHold = true;
+    if (mode === 'race' || mode === 'countdown' || mode === 'finish') {
+      orientPausedFrom = mode;
+      try { sdk.setPlaying(false); } catch (e) {}
+    } else {
+      orientPausedFrom = null;
+    }
+    try { engineAudio(0, false, false); } catch (e) {}
+  } else if (!need && orientHold) {
+    orientHold = false;
+    // Countdown already reached GO while the phone was portrait — start now.
+    if (mode === 'countdown' && !countdownTick) {
+      UI.countdown(0);
+      beginRacing();
+    } else if (orientPausedFrom && mode !== 'pause' && mode !== 'result' && mode !== 'menu') {
+      try { sdk.setPlaying(true); } catch (e) {}
+    }
+    orientPausedFrom = null;
+  }
+}
+
 function resize() {
   const w = innerWidth, h = innerHeight;
   camera.aspect = w / Math.max(1, h);
   camera.updateProjectionMatrix();
   renderer.setSize(w, h, false);
+  applyOrientation();
 }
 window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', () => setTimeout(resize, 50));
+try {
+  const mq = window.matchMedia('(orientation: portrait)');
+  if (mq) {
+    const onMq = () => resize();
+    if (typeof mq.addEventListener === 'function') mq.addEventListener('change', onMq);
+    else if (typeof mq.addListener === 'function') mq.addListener(onMq);
+  }
+} catch (e) {}
+if (window.visualViewport) {
+  visualViewport.addEventListener('resize', resize);
+}
+
+let didLockOrient = false;
+function onFirstUserGesture() {
+  if (didLockOrient) return;
+  didLockOrient = true;
+  tryLockLandscape();
+}
+document.addEventListener('pointerdown', onFirstUserGesture, { capture: true });
+document.addEventListener('touchend', onFirstUserGesture, { capture: true });
+document.addEventListener('click', onFirstUserGesture, { capture: true });
+document.addEventListener('fullscreenchange', () => {
+  if (document.fullscreenElement) tryLockLandscape();
+});
 
 function applyAnisotropy(root, value) {
   if (!root) return;
@@ -124,6 +212,7 @@ async function boot() {
   UI.refreshHome(selectedTrack);
   hookUI();
   installQA();
+  applyOrientation();
   requestAnimationFrame(loop);
 }
 
@@ -266,10 +355,11 @@ function startRace(trackId, opts = {}) {
     let n = 3;
     UI.countdown(n);
     beep(440, 0.1);
-    const iv = setInterval(() => {
+    countdownTick = setInterval(() => {
+      if (orientHold) return;
       n--;
-      if (mode !== 'countdown') { clearInterval(iv); return; }
-      if (n <= 0) { clearInterval(iv); UI.countdown('GO'); beep(880, 0.18); setTimeout(() => { UI.countdown(0); if (mode === 'countdown') beginRacing(); }, 280); }
+      if (mode !== 'countdown') { clearInterval(countdownTick); countdownTick = null; return; }
+      if (n <= 0) { clearInterval(countdownTick); countdownTick = null; UI.countdown('GO'); beep(880, 0.18); setTimeout(() => { UI.countdown(0); if (mode === 'countdown' && !orientHold) beginRacing(); }, 280); }
       else { UI.countdown(n); beep(440, 0.1); }
     }, 1000);
   }
@@ -586,6 +676,12 @@ function loop(now) {
   }
   if (sky && sky.userData.mat) sky.userData.mat.uniforms.time.value = now * 0.001;
 
+  if (orientHold) {
+    try { engineAudio(0, false, false); } catch (e) {}
+    renderer.render(scene, camera);
+    return;
+  }
+
   if (mode === 'menu') menuCam(dt);
   if (mode === 'countdown' && field) chaseCam(field.player, dt);
 
@@ -749,6 +845,10 @@ function installQA() {
     },
     timeScale: 1,
     lockQuality: false,
+    get orientHold() { return !!orientHold; },
+    needsRotate() { return needsRotateOverlay(); },
+    isPhoneLike() { return isPhoneLike(); },
+    applyOrientation() { applyOrientation(); return { hold: !!orientHold, need: needsRotateOverlay(), phone: isPhoneLike() }; },
     get quality() { return quality; },
     setQuality(q) { quality = q; applyQuality(); return quality; },
     renderInfo() {
@@ -821,7 +921,8 @@ function installQA() {
     advance(sec) {
       if (!raceState || !field) return null;
       let left = Math.max(0, +sec || 0);
-      while (left > 0 && (mode === 'race' || mode === 'finish') && !field.racers.every(r => r.finished)) {
+      if (orientHold) return window.__qa.live && window.__qa.live();
+      while (left > 0 && !orientHold && (mode === 'race' || mode === 'finish') && !field.racers.every(r => r.finished)) {
         const chunk = Math.min(0.4, left);
         const evs = stepRace(raceState, input.read(), chunk);
         raceClock += chunk;

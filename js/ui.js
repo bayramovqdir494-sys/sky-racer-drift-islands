@@ -384,7 +384,10 @@ export function bindInput(state) {
     const left = inp.left || keys.ArrowLeft || keys.KeyA;
     const right = inp.right || keys.ArrowRight || keys.KeyD;
     return {
-      steer: (right ? 1 : 0) - (left ? 1 : 0),
+      // Chase cam looks along heading (sin yaw, 0, cos yaw). Positive yaw turns
+      // toward +X, which is screen-left from that view, so player right must be -steer.
+      // AI computes steer from world yaw error and must keep the unflipped sign.
+      steer: (left ? 1 : 0) - (right ? 1 : 0),
       gas: inp.gas || keys.ArrowUp || keys.KeyW ? 1 : 0,
       brake: inp.brake || keys.ArrowDown || keys.KeyS ? 1 : 0,
       drift: inp.drift || keys.Space ? 1 : 0,
